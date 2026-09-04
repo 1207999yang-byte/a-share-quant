@@ -12,14 +12,14 @@ except Exception:
     ak = None
 
 st.set_page_config(
-    page_title="A股量化助手 V3.0",
+    page_title="A股量化助手 V3.1",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 A股量化助手 V3.0")
-st.caption("自动行情 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
+st.title("📈 A股量化助手 V3.1")
+st.caption("自动行情 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
 st.warning("本工具仅用于信息整理、研究与模拟，不构成投资建议；行情/财务数据来自第三方公开数据源，可能存在延迟、缺失或接口波动。")
 
 # -------------------- 通用工具 --------------------
@@ -78,12 +78,44 @@ def score_higher_better(x, bad, good):
     return 100 * (x - bad) / (good - bad)
 
 # -------------------- 数据获取 --------------------
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_spot():
+    """优先东财；失败后尝试新浪。注意：两者都是公开数据源，可能被限流。"""
     if ak is None:
         raise RuntimeError("AKShare 未成功安装。")
-    df = ak.stock_zh_a_spot_em()
-    return df
+    errors = []
+    for fn in (getattr(ak, "stock_zh_a_spot_em", None), getattr(ak, "stock_zh_a_spot", None)):
+        if fn is None:
+            continue
+        try:
+            df = fn()
+            if df is not None and not df.empty and "代码" in df.columns:
+                return df
+        except Exception as e:
+            errors.append(type(e).__name__ + ": " + str(e)[:160])
+    raise RuntimeError("实时行情源暂时不可用。可直接输入股票代码继续分析。\n" + " | ".join(errors))
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_quote(code):
+    """单只股票报价：先从批量行情中取；批量失败则尝试腾讯历史接口的最新一条。"""
+    code = clean_code(code)
+    errors = []
+    try:
+        spot = load_spot()
+        row = spot[spot["代码"].astype(str).str.zfill(6) == code]
+        if not row.empty:
+            return row.iloc[0].to_dict()
+    except Exception as e:
+        errors.append("批量行情: " + str(e)[:120])
+    try:
+        symbol = market_suffix(code).lower()
+        df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=(datetime.now()-timedelta(days=30)).strftime("%Y%m%d"), end_date=datetime.now().strftime("%Y%m%d"), adjust="")
+        if df is not None and not df.empty:
+            r = df.iloc[-1]
+            return {"代码": code, "名称": code, "最新价": to_num(r.get("close")), "涨跌幅": np.nan, "市盈率-动态": np.nan, "市净率": np.nan}
+    except Exception as e:
+        errors.append("腾讯行情: " + str(e)[:120])
+    raise RuntimeError("无法获取该股票的实时/最近收盘报价。请稍后重试。" + (" | ".join(errors) if errors else ""))
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code, days=760, adjust="qfq"):
@@ -91,32 +123,67 @@ def load_hist(code, days=760, adjust="qfq"):
         raise RuntimeError("AKShare 未成功安装。")
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    df = ak.stock_zh_a_hist(
-        symbol=clean_code(code),
-        period="daily",
-        start_date=start,
-        end_date=end,
-        adjust=adjust,
-        timeout=20,
-    )
-    if df is None or df.empty:
-        raise RuntimeError("没有获取到历史行情。")
-    df["日期"] = pd.to_datetime(df["日期"], errors="coerce")
-    for c in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "涨跌幅", "换手率"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(subset=["日期", "收盘"]).sort_values("日期").drop_duplicates("日期")
+    errors = []
+    # 1) 东方财富：数据字段最完整
+    try:
+        df = ak.stock_zh_a_hist(symbol=clean_code(code), period="daily", start_date=start, end_date=end, adjust=adjust)
+        if df is not None and not df.empty:
+            df["日期"] = pd.to_datetime(df["日期"], errors="coerce")
+            for c in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "涨跌幅", "换手率"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            return df.dropna(subset=["日期", "收盘"]).sort_values("日期").drop_duplicates("日期")
+    except Exception as e:
+        errors.append("东财历史: " + str(e)[:120])
+
+    # 2) 腾讯：作为东财历史接口的备用源
+    try:
+        symbol = market_suffix(code).lower()
+        df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start, end_date=end, adjust=adjust)
+        if df is not None and not df.empty:
+            df = df.rename(columns={"date":"日期", "open":"开盘", "close":"收盘", "high":"最高", "low":"最低", "amount":"成交量"})
+            df["日期"] = pd.to_datetime(df["日期"], errors="coerce")
+            for c in ["开盘", "收盘", "最高", "最低", "成交量"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            if "成交额" not in df.columns:
+                df["成交额"] = np.nan
+            if "涨跌幅" not in df.columns:
+                df["涨跌幅"] = df["收盘"].pct_change() * 100
+            if "换手率" not in df.columns:
+                df["换手率"] = np.nan
+            return df.dropna(subset=["日期", "收盘"]).sort_values("日期").drop_duplicates("日期")
+    except Exception as e:
+        errors.append("腾讯历史: " + str(e)[:120])
+    raise RuntimeError("历史行情暂时不可用，请稍后重试。" + (" | ".join(errors) if errors else ""))
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_financial(code):
     if ak is None:
-        raise RuntimeError("AKShare 未成功安装。")
-    symbol = market_suffix(code)
-    df = ak.stock_financial_analysis_indicator_em(symbol=symbol, indicator="按报告期")
-    if df is None or df.empty:
-        raise RuntimeError("没有获取到财务指标。")
-    df["REPORT_DATE"] = pd.to_datetime(df["REPORT_DATE"], errors="coerce")
-    return df.sort_values("REPORT_DATE").drop_duplicates("REPORT_DATE").reset_index(drop=True)
+        return pd.DataFrame()
+    errors = []
+    for fn, kwargs in [
+        (getattr(ak, "stock_financial_analysis_indicator_em", None), {"symbol": clean_code(code), "indicator": "按报告期"}),
+        (getattr(ak, "stock_financial_analysis_indicator", None), {"symbol": market_suffix(code).lower()}),
+    ]:
+        if fn is None:
+            continue
+        try:
+            df = fn(**kwargs)
+            if df is not None and not df.empty:
+                # 尽量统一报告期字段
+                if "REPORT_DATE" not in df.columns:
+                    for c in ["报告期", "日期", "REPORT_DATE"]:
+                        if c in df.columns:
+                            df["REPORT_DATE"] = pd.to_datetime(df[c], errors="coerce")
+                            break
+                if "REPORT_DATE" in df.columns:
+                    df["REPORT_DATE"] = pd.to_datetime(df["REPORT_DATE"], errors="coerce")
+                    return df.sort_values("REPORT_DATE").drop_duplicates("REPORT_DATE").reset_index(drop=True)
+                return df
+        except Exception as e:
+            errors.append(type(e).__name__ + ": " + str(e)[:120])
+    return pd.DataFrame()
 
 def get_latest_financial(df):
     if df is None or df.empty:
@@ -136,12 +203,17 @@ def search_stocks(query, spot):
     return spot.loc[mask, cols].head(30)
 
 # -------------------- 量化评分 --------------------
-def build_analysis(code, spot, hist, fin):
+def build_analysis(code, spot, hist, fin, quote=None):
     code = clean_code(code)
-    spot_row = spot[spot["代码"].astype(str).str.zfill(6) == code]
-    if spot_row.empty:
-        raise RuntimeError("股票不在当前A股实时行情列表中，可能已停牌、退市或代码有误。")
-    s = spot_row.iloc[0]
+    if quote is not None:
+        s = pd.Series(quote)
+    elif spot is not None and not spot.empty and "代码" in spot.columns:
+        spot_row = spot[spot["代码"].astype(str).str.zfill(6) == code]
+        if spot_row.empty:
+            raise RuntimeError("股票不在当前A股实时行情列表中，可能已停牌、退市或代码有误。")
+        s = spot_row.iloc[0]
+    else:
+        s = pd.Series({"代码": code, "名称": code, "最新价": np.nan})
     latest_fin = get_latest_financial(fin)
 
     px = hist["收盘"].astype(float).dropna()
@@ -269,47 +341,49 @@ tabs = st.tabs(["🔎 股票搜索与量化评分", "📊 K线与技术指标", 
 # -------------------- Tab 1 --------------------
 with tabs[0]:
     st.subheader("输入股票代码或名称")
-    if ak is None:
-        st.error("AKShare 未安装，请检查 requirements.txt。")
-        st.stop()
-
     c1, c2 = st.columns([3, 1])
     with c1:
         query = st.text_input("股票代码/名称", value="600519", placeholder="例如：600519、贵州茅台")
     with c2:
         do_search = st.button("🔍 搜索", use_container_width=True)
 
+    spot = pd.DataFrame()
     try:
-        with st.spinner("正在获取A股行情列表…"):
+        with st.spinner("正在获取股票列表…"):
             spot = load_spot()
+        results = search_stocks(query, spot)
+        if not results.empty:
+            st.dataframe(results, use_container_width=True, hide_index=True)
+        else:
+            st.info("没有找到匹配股票，请检查代码或名称。")
     except Exception as e:
-        st.error(f"行情获取失败：{e}")
-        st.stop()
+        # 批量列表失败不再阻断整个 App；代码直查仍可用
+        st.warning("股票列表数据源暂时不可用。你仍可以直接输入 6 位股票代码进行分析。")
+        results = pd.DataFrame()
 
-    results = search_stocks(query, spot)
-    if not results.empty:
-        st.write("搜索结果（点击下方代码后，可复制到输入框）：")
-        st.dataframe(results, use_container_width=True, hide_index=True)
-    else:
-        st.info("没有找到匹配股票，请检查代码或名称。")
-
-    # 自动从搜索结果选择精确代码
     code = clean_code(query)
-    if not (spot["代码"].astype(str).str.zfill(6) == code).any() and not results.empty:
+    if not code and not results.empty:
+        code = str(results.iloc[0]["代码"]).zfill(6)
+    elif results is not None and not results.empty and not (spot.empty) and not (spot["代码"].astype(str).str.zfill(6) == code).any():
         code = str(results.iloc[0]["代码"]).zfill(6)
 
     analyze = st.button("🚀 开始量化分析", type="primary", use_container_width=True)
     if analyze:
-        try:
-            with st.spinner("正在获取历史行情和财务指标…"):
-                hist = load_hist(code, adjust=adjust)
-                fin = load_financial(code)
-                a = build_analysis(code, spot, hist, fin)
-            st.session_state["analysis"] = a
-            st.session_state["hist"] = hist
-        except Exception as e:
-            st.error(f"分析失败：{e}")
-            st.info("如果是接口暂时不可用，请等待几十秒后重试；也可以换一只股票测试。")
+        if len(code) != 6:
+            st.error("请输入 6 位 A 股股票代码，例如 600519。")
+        else:
+            try:
+                with st.spinner("正在获取行情、历史数据和财务指标…"):
+                    quote = load_quote(code)
+                    hist = load_hist(code, adjust=adjust)
+                    fin = load_financial(code)
+                    a = build_analysis(code, spot, hist, fin, quote=quote)
+                st.session_state["analysis"] = a
+                st.session_state["hist"] = hist
+                st.session_state["quote"] = quote
+            except Exception as e:
+                st.error(f"分析失败：{e}")
+                st.info("如果数据源暂时限流，请等待 30～60 秒再试。V3.1 已加入备用历史行情源，但公开接口仍可能临时不可用。")
 
     if "analysis" in st.session_state:
         a = st.session_state["analysis"]
@@ -318,7 +392,6 @@ with tabs[0]:
         title_col.markdown(f"## {a['名称']}  `{a['代码']}`")
         score_col.metric("综合评分", "—" if pd.isna(a["综合评分"]) else f"{a['综合评分']:.1f}/100")
         action_col.metric("模型信号", a["建议"])
-
         st.caption(a["建议说明"])
         m = st.columns(6)
         m[0].metric("最新价", fmt_num(a["最新价"]))
@@ -327,17 +400,14 @@ with tabs[0]:
         m[3].metric("PB", fmt_num(a["PB"]))
         m[4].metric("ROE", fmt_num(a["ROE"], "%"))
         m[5].metric("趋势", a["趋势"])
-
-        score_df = pd.DataFrame([
-            {"因子": k, "分数": None if pd.isna(v) else round(v, 1)}
-            for k, v in a["分项"].items()
-        ])
+        score_df = pd.DataFrame([{"因子": k, "分数": None if pd.isna(v) else round(v, 1)} for k, v in a["分项"].items()])
         st.dataframe(score_df, use_container_width=True, hide_index=True)
-
+        missing = [k for k, v in a["分项"].items() if pd.isna(v)]
+        if missing:
+            st.warning("以下因子暂缺数据：" + "、".join(missing) + "。综合评分会按可用因子重新归一化，不会因为单一财务接口失败而直接报错。")
         pos = max_position / 100
-        suggested_amount = initial_capital * pos
-        suggested_amount = min(suggested_amount, initial_capital * (1 - cash_buffer / 100))
-        st.info(f"模拟参考仓位上限：{max_position}%；以{initial_capital:,.0f}元本金计算，单股最多约 ¥{suggested_amount:,.0f}。实际交易还应考虑流动性、滑点、交易规则等。")
+        suggested_amount = min(initial_capital * pos, initial_capital * (1 - cash_buffer / 100))
+        st.info(f"模拟参考仓位上限：{max_position}%；以 {initial_capital:,.0f} 元本金计算，单股最多约 ¥{suggested_amount:,.0f}。模型信号仅供研究与模拟。")
 
 # -------------------- Tab 2 --------------------
 with tabs[1]:
@@ -393,9 +463,9 @@ with tabs[2]:
     if positions:
         for code, p in positions.items():
             try:
-                spot_row = spot[spot["代码"].astype(str).str.zfill(6) == code].iloc[0]
-                price = to_num(spot_row["最新价"])
-                name = str(spot_row["名称"])
+                q = load_quote(code)
+                price = to_num(q.get("最新价"))
+                name = str(q.get("名称", code))
             except Exception:
                 price = p["cost_price"]
                 name = code
@@ -477,8 +547,8 @@ with tabs[2]:
         else:
             p = positions[code]
             try:
-                row = spot[spot["代码"].astype(str).str.zfill(6) == code].iloc[0]
-                price = to_num(row["最新价"])
+                q = load_quote(code)
+                price = to_num(q.get("最新价"))
             except Exception:
                 price = p["cost_price"]
             amount = p["shares"] * price
@@ -518,7 +588,7 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("使用说明")
     st.markdown("""
-### V3.0 做了什么？
+### V3.1 做了什么？
 1. **自动获取A股行情**：不再需要手工上传CSV。
 2. **股票代码/名称搜索**：例如输入 `600519` 或 `贵州茅台`。
 3. **多因子量化评分**：
@@ -548,7 +618,7 @@ Streamlit Community Cloud 会根据 `requirements.txt` 安装依赖，然后运�
 
 ### 常见问题
 **1. 行情获取失败**
-可能是数据源暂时限流、网络波动或接口变更。等待后重试即可。
+可能是公开数据源限流、网络波动或接口变更。V3.1 会在批量行情失败时尝试备用源；若仍失败，稍后重试即可。
 
 **2. 为什么财务数据不是今天的？**
 财务指标来自上市公司定期报告，不会像股价一样实时变化。
