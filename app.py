@@ -12,22 +12,29 @@ except Exception:
     ak = None
 
 st.set_page_config(
-    page_title="A股量化助手 V3.1",
+    page_title="A股量化助手 V3.2",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 A股量化助手 V3.1")
-st.caption("自动行情 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
+st.title("📈 A股量化助手 V3.2")
+st.caption("自动行情 + V3.2代码修复 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
 st.warning("本工具仅用于信息整理、研究与模拟，不构成投资建议；行情/财务数据来自第三方公开数据源，可能存在延迟、缺失或接口波动。")
 
 # -------------------- 通用工具 --------------------
 def clean_code(code):
+    """把 600519、sh600519、600519.SH 等输入统一成 6 位数字代码。"""
+    if code is None:
+        return ""
     s = str(code).strip().upper()
-    s = re.sub(r"\.SH$|\.SZ$|\.BJ$", "", s)
-    s = re.sub(r"[^0-9]", "", s)
-    return s.zfill(6) if s else ""
+    # 先直接抓取连续的 6 位股票代码，避免把搜索结果里的 sh600519 当成非法代码
+    m = re.search(r"(?<!\\d)(\\d{6})(?!\\d)", s)
+    if m:
+        return m.group(1)
+    # 兼容少于 6 位的纯数字输入
+    digits = re.sub(r"\\D", "", s)
+    return digits.zfill(6) if digits else ""
 
 def market_suffix(code):
     code = clean_code(code)
@@ -363,14 +370,16 @@ with tabs[0]:
 
     code = clean_code(query)
     if not code and not results.empty:
-        code = str(results.iloc[0]["代码"]).zfill(6)
-    elif results is not None and not results.empty and not (spot.empty) and not (spot["代码"].astype(str).str.zfill(6) == code).any():
-        code = str(results.iloc[0]["代码"]).zfill(6)
+        code = clean_code(results.iloc[0]["代码"])
+    elif results is not None and not results.empty and not spot.empty:
+        result_codes = spot["代码"].astype(str).map(clean_code)
+        if code not in set(result_codes):
+            code = clean_code(results.iloc[0]["代码"])
 
     analyze = st.button("🚀 开始量化分析", type="primary", use_container_width=True)
     if analyze:
         if len(code) != 6:
-            st.error("请输入 6 位 A 股股票代码，例如 600519。")
+            st.error("股票代码识别失败，请输入 6 位代码，例如 600519；也支持 sh600519、600519.SH。")
         else:
             try:
                 with st.spinner("正在获取行情、历史数据和财务指标…"):
