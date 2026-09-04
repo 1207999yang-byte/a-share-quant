@@ -12,14 +12,14 @@ except Exception:
     ak = None
 
 st.set_page_config(
-    page_title="A股量化助手 V3.3",
+    page_title="A股量化助手 V3.4",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 A股量化助手 V3.3")
-st.caption("自动行情 + V3.3代码修复 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
+st.title("📈 A股量化助手 V3.4")
+st.caption("自动行情 + V3.4代码修复 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
 st.warning("本工具仅用于信息整理、研究与模拟，不构成投资建议；行情/财务数据来自第三方公开数据源，可能存在延迟、缺失或接口波动。")
 
 # -------------------- 通用工具 --------------------
@@ -45,6 +45,18 @@ def market_suffix(code):
     if code.startswith(("430", "830", "831", "832", "833", "834", "835", "836", "837", "838", "839", "870", "871", "872", "873")):
         return f"{code}.BJ"
     return f"{code}.SZ"
+
+
+def tx_symbol(code):
+    """腾讯历史行情接口使用 sh600519 / sz000001 / bj830xxx 格式。"""
+    code = clean_code(code)
+    if code.startswith(("600", "601", "603", "605", "688")):
+        return f"sh{code}"
+    if code.startswith(("000", "001", "002", "003", "300", "301")):
+        return f"sz{code}"
+    if code.startswith(("430", "830", "831", "832", "833", "834", "835", "836", "837", "838", "839", "870", "871", "872", "873")):
+        return f"bj{code}"
+    return f"sz{code}"
 
 def to_num(v):
     try:
@@ -115,14 +127,14 @@ def load_quote(code):
     except Exception as e:
         errors.append("批量行情: " + str(e)[:120])
     try:
-        symbol = market_suffix(code).lower()
+        symbol = tx_symbol(code)
         df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=(datetime.now()-timedelta(days=30)).strftime("%Y%m%d"), end_date=datetime.now().strftime("%Y%m%d"), adjust="")
         if df is not None and not df.empty:
             r = df.iloc[-1]
             return {"代码": code, "名称": code, "最新价": to_num(r.get("close")), "涨跌幅": np.nan, "市盈率-动态": np.nan, "市净率": np.nan}
     except Exception as e:
         errors.append("腾讯行情: " + str(e)[:120])
-    raise RuntimeError("无法获取该股票的实时/最近收盘报价。请稍后重试。" + (" | ".join(errors) if errors else ""))
+    raise RuntimeError("无法获取该股票的实时/最近收盘报价。请稍后重试；若使用腾讯备用源，程序会自动使用正确的 sh/sz 股票标识。" + (" | ".join(errors) if errors else ""))
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code, days=760, adjust="qfq"):
@@ -145,7 +157,7 @@ def load_hist(code, days=760, adjust="qfq"):
 
     # 2) 腾讯：作为东财历史接口的备用源
     try:
-        symbol = market_suffix(code).lower()
+        symbol = tx_symbol(code)
         df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start, end_date=end, adjust=adjust)
         if df is not None and not df.empty:
             df = df.rename(columns={"date":"日期", "open":"开盘", "close":"收盘", "high":"最高", "low":"最低", "amount":"成交量"})
