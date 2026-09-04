@@ -12,14 +12,14 @@ except Exception:
     ak = None
 
 st.set_page_config(
-    page_title="A股量化助手 V3.2",
+    page_title="A股量化助手 V3.3",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 A股量化助手 V3.2")
-st.caption("自动行情 + V3.2代码修复 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
+st.title("📈 A股量化助手 V3.3")
+st.caption("自动行情 + V3.3代码修复 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
 st.warning("本工具仅用于信息整理、研究与模拟，不构成投资建议；行情/财务数据来自第三方公开数据源，可能存在延迟、缺失或接口波动。")
 
 # -------------------- 通用工具 --------------------
@@ -29,11 +29,11 @@ def clean_code(code):
         return ""
     s = str(code).strip().upper()
     # 先直接抓取连续的 6 位股票代码，避免把搜索结果里的 sh600519 当成非法代码
-    m = re.search(r"(?<!\\d)(\\d{6})(?!\\d)", s)
+    m = re.search(r"(?<!\d)(\d{6})(?!\d)", s)
     if m:
         return m.group(1)
     # 兼容少于 6 位的纯数字输入
-    digits = re.sub(r"\\D", "", s)
+    digits = re.sub(r"\D", "", s)
     return digits.zfill(6) if digits else ""
 
 def market_suffix(code):
