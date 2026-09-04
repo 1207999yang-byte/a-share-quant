@@ -12,14 +12,14 @@ except Exception:
     ak = None
 
 st.set_page_config(
-    page_title="A股量化助手 V3.4",
+    page_title="A股量化助手 V3.5",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 A股量化助手 V3.4")
-st.caption("自动行情 + V3.4代码修复 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
+st.title("📈 A股量化助手 V3.5")
+st.caption("自动行情 + V3.5代码修复 + 多源容错 + 股票搜索 + 多因子量化评分 + K线 + 买入/观望/回避 + 10万元模拟账户")
 st.warning("本工具仅用于信息整理、研究与模拟，不构成投资建议；行情/财务数据来自第三方公开数据源，可能存在延迟、缺失或接口波动。")
 
 # -------------------- 通用工具 --------------------
@@ -177,37 +177,151 @@ def load_hist(code, days=760, adjust="qfq"):
     raise RuntimeError("历史行情暂时不可用，请稍后重试。" + (" | ".join(errors) if errors else ""))
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _pick_col(df, keywords):
+    """按关键词从不同数据源的财务字段中寻找最接近的列。"""
+    if df is None or df.empty:
+        return None
+    cols = [str(c) for c in df.columns]
+    # 优先完全匹配/包含全部关键词
+    for keys in keywords:
+        for c in cols:
+            if all(k.lower() in c.lower() for k in keys):
+                return c
+    return None
+
+
+def _extract_row_by_code(df, code):
+    if df is None or df.empty:
+        return None
+    code = clean_code(code)
+    for c in ["代码", "股票代码", "证券代码", "symbol", "ts_code"]:
+        if c in df.columns:
+            mask = df[c].astype(str).map(clean_code) == code
+            if mask.any():
+                return df.loc[mask].iloc[-1]
+    # 有些接口只返回目标股票一行
+    if len(df) == 1:
+        return df.iloc[0]
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_financial(code):
+    """多源财务数据：优先财务指标，失败后尝试同花顺/同行比较/业绩报表。"""
     if ak is None:
         return pd.DataFrame()
+    code = clean_code(code)
+    candidates = []
     errors = []
-    for fn, kwargs in [
-        (getattr(ak, "stock_financial_analysis_indicator_em", None), {"symbol": clean_code(code), "indicator": "按报告期"}),
-        (getattr(ak, "stock_financial_analysis_indicator", None), {"symbol": market_suffix(code).lower()}),
-    ]:
-        if fn is None:
-            continue
+
+    # 1. 东方财富主要财务指标
+    fn = getattr(ak, "stock_financial_analysis_indicator_em", None)
+    if fn:
         try:
-            df = fn(**kwargs)
+            df = fn(symbol=code, indicator="按报告期")
             if df is not None and not df.empty:
-                # 尽量统一报告期字段
-                if "REPORT_DATE" not in df.columns:
-                    for c in ["报告期", "日期", "REPORT_DATE"]:
-                        if c in df.columns:
-                            df["REPORT_DATE"] = pd.to_datetime(df[c], errors="coerce")
-                            break
-                if "REPORT_DATE" in df.columns:
-                    df["REPORT_DATE"] = pd.to_datetime(df["REPORT_DATE"], errors="coerce")
-                    return df.sort_values("REPORT_DATE").drop_duplicates("REPORT_DATE").reset_index(drop=True)
-                return df
+                candidates.append(("东方财富财务指标", df))
         except Exception as e:
-            errors.append(type(e).__name__ + ": " + str(e)[:120])
-    return pd.DataFrame()
+            errors.append("东财财务指标: " + str(e)[:100])
+
+    # 2. 新浪/旧版财务指标
+    fn = getattr(ak, "stock_financial_analysis_indicator", None)
+    if fn:
+        try:
+            df = fn(symbol=market_suffix(code).lower())
+            if df is not None and not df.empty:
+                candidates.append(("新浪财务指标", df))
+        except Exception as e:
+            errors.append("新浪财务指标: " + str(e)[:100])
+
+    # 3. 同花顺新版财务摘要（单股）
+    fn = getattr(ak, "stock_financial_abstract_new_ths", None)
+    if fn:
+        try:
+            df = fn(symbol=code)
+            if df is not None and not df.empty:
+                candidates.append(("同花顺财务摘要", df))
+        except Exception as e:
+            errors.append("同花顺财务摘要: " + str(e)[:100])
+
+    # 4. 同花顺旧版财务摘要
+    fn = getattr(ak, "stock_financial_abstract_ths", None)
+    if fn:
+        try:
+            df = fn(symbol=code)
+            if df is not None and not df.empty:
+                candidates.append(("同花顺旧版财务摘要", df))
+        except Exception as e:
+            errors.append("同花顺旧版财务摘要: " + str(e)[:100])
+
+    # 5. 同行比较：可提供 ROE/成长数据，即使主要财务指标接口失效
+    fn = getattr(ak, "stock_zh_growth_comparison_em", None)
+    if fn:
+        try:
+            df = fn(symbol=market_suffix(code))
+            row = _extract_row_by_code(df, code)
+            if row is not None:
+                d = row.to_dict()
+                # 保留代码与所有字段，稍后统一映射
+                candidates.append(("东财成长性比较", pd.DataFrame([d])))
+        except Exception as e:
+            errors.append("成长性比较: " + str(e)[:100])
+
+    fn = getattr(ak, "stock_zh_dupont_comparison_em", None)
+    if fn:
+        try:
+            df = fn(symbol=market_suffix(code))
+            row = _extract_row_by_code(df, code)
+            if row is not None:
+                candidates.append(("东财杜邦分析", pd.DataFrame([row.to_dict()])))
+        except Exception as e:
+            errors.append("杜邦分析: " + str(e)[:100])
+
+    # 把多个来源压缩成一个标准字段行
+    out = {"REPORT_DATE": pd.NaT, "FIN_SOURCE": ""}
+    mapping = {
+        "ROEJQ": [["ROEJQ"], ["净资产收益率"], ["股东权益回报率"], ["ROE"]],
+        "TOTALOPERATEREVETZ": [["TOTALOPERATEREVETZ"], ["营业收入", "同比"], ["营业总收入", "同比"], ["营业收入增长率"]],
+        "PARENTNETPROFITTZ": [["PARENTNETPROFITTZ"], ["净利润", "同比"], ["净利润增长率"]],
+        "ZCFZL": [["ZCFZL"], ["资产负债率"], ["负债率"]],
+        "JYXJLYYSR": [["JYXJLYYSR"], ["经营现金流", "营收"], ["经营现金流", "营业收入"]],
+    }
+    sources = []
+    for source_name, df in candidates:
+        row = _extract_row_by_code(df, code)
+        if row is None:
+            row = df.iloc[-1] if len(df) else None
+        if row is None:
+            continue
+        sources.append(source_name)
+        if pd.isna(out.get("REPORT_DATE")):
+            for c in ["REPORT_DATE", "报告期", "日期", "公告日期"]:
+                if c in row.index:
+                    d = pd.to_datetime(row.get(c), errors="coerce")
+                    if pd.notna(d):
+                        out["REPORT_DATE"] = d
+                        break
+        for canonical, keys_list in mapping.items():
+            if pd.notna(out.get(canonical, np.nan)):
+                continue
+            col = _pick_col(df, keys_list)
+            if col is not None:
+                val = to_num(row.get(col))
+                if pd.notna(val):
+                    out[canonical] = val
+    out["FIN_SOURCE"] = "、".join(dict.fromkeys(sources))
+    # 至少有一个有效指标才返回
+    valid = [k for k in mapping if pd.notna(out.get(k, np.nan))]
+    return pd.DataFrame([out]) if valid else pd.DataFrame()
 
 def get_latest_financial(df):
     if df is None or df.empty:
         return {}
-    row = df.dropna(subset=["REPORT_DATE"]).iloc[-1]
+    if "REPORT_DATE" in df.columns:
+        valid = df.dropna(subset=["REPORT_DATE"])
+        row = valid.iloc[-1] if not valid.empty else df.iloc[-1]
+    else:
+        row = df.iloc[-1]
     return {k: row.get(k) for k in df.columns}
 
 def search_stocks(query, spot):
@@ -334,6 +448,8 @@ def build_analysis(code, spot, hist, fin, quote=None):
         "建议": action,
         "建议说明": reason,
         "财报日期": latest_fin.get("REPORT_DATE"),
+        "财务数据源": latest_fin.get("FIN_SOURCE", ""),
+        "数据完整度": sum(pd.notna(v) for v in components.values()) / len(components),
     }
 
 def fmt_pct(x):
@@ -424,8 +540,12 @@ with tabs[0]:
         score_df = pd.DataFrame([{"因子": k, "分数": None if pd.isna(v) else round(v, 1)} for k, v in a["分项"].items()])
         st.dataframe(score_df, use_container_width=True, hide_index=True)
         missing = [k for k, v in a["分项"].items() if pd.isna(v)]
+        completeness = a.get("数据完整度", 0)
+        st.metric("因子数据完整度", f"{completeness:.0%}")
         if missing:
-            st.warning("以下因子暂缺数据：" + "、".join(missing) + "。综合评分会按可用因子重新归一化，不会因为单一财务接口失败而直接报错。")
+            st.warning("以下因子暂缺数据：" + "、".join(missing) + "。综合评分会按可用因子重新归一化；数据源恢复后重新分析即可。")
+        if a.get("财务数据源"):
+            st.caption("财务数据源：" + str(a["财务数据源"]))
         pos = max_position / 100
         suggested_amount = min(initial_capital * pos, initial_capital * (1 - cash_buffer / 100))
         st.info(f"模拟参考仓位上限：{max_position}%；以 {initial_capital:,.0f} 元本金计算，单股最多约 ¥{suggested_amount:,.0f}。模型信号仅供研究与模拟。")
