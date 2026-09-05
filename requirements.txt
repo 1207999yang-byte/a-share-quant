@@ -1,5 +1,4 @@
 streamlit>=1.50,<2
 pandas>=2.2,<3
 numpy>=2.0,<3
-plotly>=6.0,<7
 akshare>=1.18.94,<1.19
